@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import io
 import os
+import re
 import sqlite3
 import uuid
 from contextlib import contextmanager
@@ -28,18 +29,18 @@ st.set_page_config(
 st.markdown(
     """
     <style>
-    :root { --ink:#18332d; --muted:#6f7e79; --green:#2f7564; --paper:#f5f7f3; --line:#dce3de; }
+    :root { --ink:#15223b; --muted:#64748b; --green:#2563eb; --paper:#f4f7fb; --line:#d7e1ee; }
     .stApp { background:var(--paper); color:var(--ink); }
     .main .block-container { max-width:1500px; padding:1.3rem 2rem 3rem; }
-    section[data-testid="stSidebar"] { background:#173f36; }
+    section[data-testid="stSidebar"] { background:#0f2a55; }
     section[data-testid="stSidebar"] * { color:#eef7f3; }
     section[data-testid="stSidebar"] div[role="radiogroup"] label { border-radius:10px; padding:.58rem .7rem; }
     section[data-testid="stSidebar"] div[role="radiogroup"] label:has(input:checked) { background:rgba(255,255,255,.14); }
     .brand { padding:.35rem .2rem 1.35rem; }
     .brand b { font-size:1.3rem; }
     .brand span { display:inline-grid; place-items:center; width:38px; height:38px; margin-right:.6rem;
-        border-radius:11px; background:#d8ede4; color:#214e43!important; }
-    .brand small { display:block; margin:.35rem 0 0 3rem; color:#b8d1c8!important; }
+        border-radius:11px; background:#dbeafe; color:#1e3a8a!important; }
+    .brand small { display:block; margin:.35rem 0 0 3rem; color:#bfdbfe!important; }
     .eyebrow { color:var(--green); font-size:.72rem; font-weight:800; letter-spacing:.12em; text-transform:uppercase; }
     .copy { color:var(--muted); margin-top:-.4rem; margin-bottom:1.2rem; }
     h1,h2,h3 { color:var(--ink); letter-spacing:-.02em; }
@@ -212,6 +213,358 @@ def save_job(data: dict, job_id: str | None = None) -> None:
             conn.execute("""UPDATE work_orders SET title=?,asset=?,location=?,department=?,due_at=?,duration_hours=?,priority=?,priority_score=?,status=?,category=?,crew_size=?,mechanical_needed=?,welding_needed=?,allowed_days=?,preferred_day=?,scope_ready=?,parts_ready=?,permits_ready=?,shutdown_ready=?,released=?,notes=?,updated_at=? WHERE id=?""", (*values, stamp, job_id))
         else:
             conn.execute("""INSERT INTO work_orders (id,title,asset,location,department,due_at,duration_hours,priority,priority_score,status,category,crew_size,mechanical_needed,welding_needed,allowed_days,preferred_day,scope_ready,parts_ready,permits_ready,shutdown_ready,released,notes,completed_at,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,?,?)""", (job_id, *values, stamp, stamp))
+
+
+def cell_text(value, default: str = "") -> str:
+    if value is None or (not isinstance(value, (list, tuple, dict)) and pd.isna(value)):
+        return default
+    return str(value).strip()
+
+
+def cell_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def cell_int(value, default: int = 0) -> int:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def cell_bool(value, default: bool = True) -> bool:
+    if value is None or (not isinstance(value, (list, tuple, dict)) and pd.isna(value)):
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() not in ("", "0", "false", "no", "off", "n")
+    return bool(value)
+
+
+def cell_datetime(value) -> str:
+    if value is None or (not isinstance(value, (list, tuple, dict)) and pd.isna(value)):
+        return (datetime.now() + timedelta(days=2)).replace(hour=8, minute=0, second=0, microsecond=0).isoformat()
+    if isinstance(value, (datetime, pd.Timestamp)):
+        return value.to_pydatetime().replace(microsecond=0).isoformat() if isinstance(value, pd.Timestamp) else value.replace(microsecond=0).isoformat()
+    text = str(value).strip()
+    try:
+        return pd.to_datetime(text).to_pydatetime().replace(microsecond=0).isoformat()
+    except Exception:
+        return text
+
+
+def job_data_from_row(row: dict) -> dict:
+    allowed = cell_text(row.get("allowed_days"), ",".join(DAYS[:5]))
+    allowed_days = [day.strip().title() for day in allowed.replace(";", ",").split(",") if day.strip().title() in DAYS]
+    return {
+        "title": cell_text(row.get("title")),
+        "asset": cell_text(row.get("asset"), "UNASSIGNED").upper(),
+        "location": cell_text(row.get("location"), "Plant"),
+        "department": cell_text(row.get("department"), "Operations"),
+        "due_at": cell_datetime(row.get("due_at")),
+        "duration": max(.5, cell_float(row.get("duration_hours"), 1)),
+        "priority": cell_text(row.get("priority"), "Medium"),
+        "score": max(1, min(20, cell_int(row.get("priority_score"), 7))),
+        "status": cell_text(row.get("status"), "Pending"),
+        "category": cell_text(row.get("category"), "Mechanical"),
+        "crew": max(1, cell_int(row.get("crew_size"), 1)),
+        "mechanical": max(0, cell_int(row.get("mechanical_needed"), 0)),
+        "welding": max(0, cell_int(row.get("welding_needed"), 0)),
+        "allowed_days": allowed_days or DAYS[:5],
+        "preferred_day": cell_text(row.get("preferred_day")),
+        "scope": cell_bool(row.get("scope_ready"), True),
+        "parts": cell_bool(row.get("parts_ready"), True),
+        "permits": cell_bool(row.get("permits_ready"), True),
+        "shutdown": cell_bool(row.get("shutdown_ready"), True),
+        "released": cell_bool(row.get("released"), True),
+        "notes": cell_text(row.get("notes")),
+    }
+
+
+def team_table_editor(team: list[dict]) -> None:
+    columns = ["id", "name", "role", "email", "skill", "weekly_hours", "availability", "active"]
+    frame = pd.DataFrame(team, columns=columns)
+    edited = st.data_editor(
+        frame,
+        key="team_spreadsheet",
+        use_container_width=True,
+        hide_index=True,
+        num_rows="fixed",
+        disabled=["id"],
+        column_config={
+            "id": st.column_config.TextColumn("ID"),
+            "name": st.column_config.TextColumn("Name", required=True),
+            "role": st.column_config.TextColumn("Role", required=True),
+            "email": st.column_config.TextColumn("Email", required=True),
+            "skill": st.column_config.SelectboxColumn("Skill", options=SKILLS, required=True),
+            "weekly_hours": st.column_config.NumberColumn("Weekly hours", min_value=1, max_value=84, step=1),
+            "availability": st.column_config.SelectboxColumn("Availability", options=["Available", "Limited", "Unavailable"]),
+            "active": st.column_config.CheckboxColumn("Active"),
+        },
+    )
+    if st.button("Save team table", type="primary", use_container_width=True):
+        records = edited.to_dict("records")
+        names = [cell_text(record.get("name")) for record in records]
+        emails = [cell_text(record.get("email")).lower() for record in records]
+        if any(not name for name in names) or any(not email for email in emails):
+            st.error("Every team member needs a name and email.")
+        elif len(emails) != len(set(emails)):
+            st.error("Each team member must have a unique email address.")
+        else:
+            try:
+                for record in records:
+                    save_team({
+                        "name": cell_text(record["name"]), "role": cell_text(record["role"], "Maintenance technician"),
+                        "email": cell_text(record["email"]), "skill": cell_text(record["skill"], "Mechanical"),
+                        "hours": max(1, cell_float(record["weekly_hours"], 40)),
+                        "availability": cell_text(record["availability"], "Available"),
+                        "active": cell_bool(record["active"], True),
+                    }, cell_text(record["id"]))
+                flash("Team table saved.")
+            except sqlite3.IntegrityError as exc:
+                st.error(f"The team table could not be saved: {exc}")
+
+
+def asset_table_editor(assets: list[dict]) -> None:
+    columns = ["id", "asset_number", "asset_name", "location", "department", "criticality", "manufacturer", "model", "active", "notes"]
+    frame = pd.DataFrame(assets, columns=columns)
+    edited = st.data_editor(
+        frame,
+        key="asset_spreadsheet",
+        use_container_width=True,
+        hide_index=True,
+        num_rows="fixed",
+        disabled=["id"],
+        column_config={
+            "id": st.column_config.TextColumn("ID"),
+            "asset_number": st.column_config.TextColumn("Asset number", required=True),
+            "asset_name": st.column_config.TextColumn("Asset name", required=True),
+            "location": st.column_config.TextColumn("Location"),
+            "department": st.column_config.TextColumn("Department"),
+            "criticality": st.column_config.SelectboxColumn("Criticality", options=["Critical", "High", "Normal", "Low"]),
+            "active": st.column_config.CheckboxColumn("Active"),
+        },
+    )
+    if st.button("Save asset table", type="primary", use_container_width=True):
+        records = edited.to_dict("records")
+        numbers = [cell_text(record.get("asset_number")).upper() for record in records]
+        if any(not number for number in numbers) or any(not cell_text(record.get("asset_name")) for record in records):
+            st.error("Every asset needs an asset number and name.")
+        elif len(numbers) != len(set(numbers)):
+            st.error("Asset numbers must be unique.")
+        else:
+            try:
+                for record in records:
+                    save_asset({
+                        "number": cell_text(record["asset_number"]), "name": cell_text(record["asset_name"]),
+                        "location": cell_text(record["location"]), "department": cell_text(record["department"], "Operations"),
+                        "criticality": cell_text(record["criticality"], "Normal"), "manufacturer": cell_text(record["manufacturer"]),
+                        "model": cell_text(record["model"]), "active": cell_bool(record["active"], True), "notes": cell_text(record["notes"]),
+                    }, cell_text(record["id"]))
+                flash("Asset table saved.")
+            except sqlite3.IntegrityError as exc:
+                st.error(f"The asset table could not be saved: {exc}")
+
+
+def job_column_config() -> dict:
+    return {
+        "id": st.column_config.TextColumn("Work order"),
+        "title": st.column_config.TextColumn("Job", required=True),
+        "asset": st.column_config.TextColumn("Asset"),
+        "location": st.column_config.TextColumn("Location"),
+        "department": st.column_config.TextColumn("Department"),
+        "due_at": st.column_config.TextColumn("Due date/time"),
+        "duration_hours": st.column_config.NumberColumn("Duration hours", min_value=.5, step=.5),
+        "priority": st.column_config.SelectboxColumn("Priority", options=PRIORITIES),
+        "priority_score": st.column_config.NumberColumn("Priority score", min_value=1, max_value=20, step=1),
+        "status": st.column_config.SelectboxColumn("Status", options=JOB_STATUSES),
+        "category": st.column_config.TextColumn("Category"),
+        "crew_size": st.column_config.NumberColumn("Crew size", min_value=1, step=1),
+        "mechanical_needed": st.column_config.NumberColumn("Mechanical", min_value=0, step=1),
+        "welding_needed": st.column_config.NumberColumn("Welding", min_value=0, step=1),
+        "allowed_days": st.column_config.TextColumn("Allowed days"),
+        "preferred_day": st.column_config.SelectboxColumn("Preferred day", options=["", *DAYS]),
+        "scope_ready": st.column_config.CheckboxColumn("Scope ready"),
+        "parts_ready": st.column_config.CheckboxColumn("Parts ready"),
+        "permits_ready": st.column_config.CheckboxColumn("Permits ready"),
+        "shutdown_ready": st.column_config.CheckboxColumn("Shutdown ready"),
+        "released": st.column_config.CheckboxColumn("Release"),
+        "notes": st.column_config.TextColumn("Notes"),
+    }
+
+
+JOB_TABLE_COLUMNS = [
+    "id", "title", "asset", "location", "department", "due_at", "duration_hours", "priority",
+    "priority_score", "status", "category", "crew_size", "mechanical_needed", "welding_needed",
+    "allowed_days", "preferred_day", "scope_ready", "parts_ready", "permits_ready", "shutdown_ready",
+    "released", "notes",
+]
+
+
+def job_table_editor(jobs: list[dict], key: str = "jobs_spreadsheet") -> None:
+    frame = pd.DataFrame(jobs, columns=JOB_TABLE_COLUMNS)
+    edited = st.data_editor(
+        frame,
+        key=key,
+        use_container_width=True,
+        hide_index=True,
+        num_rows="fixed",
+        disabled=["id"],
+        column_config=job_column_config(),
+        height=520,
+    )
+    if st.button("Save work-order table", type="primary", use_container_width=True, key=f"{key}_save"):
+        records = edited.to_dict("records")
+        if any(not cell_text(record.get("title")) for record in records):
+            st.error("Every work order needs a job title.")
+        else:
+            for record in records:
+                save_job(job_data_from_row(record), cell_text(record["id"]))
+            flash("Work-order table saved. Jobs are ready for planning review.")
+
+
+def assignment_table_editor(state: str, assignments: list[dict]) -> None:
+    columns = ["id", "day", "crew_label", "work_order_id", "title", "technicians", "hours", "status", "notes"]
+    frame = pd.DataFrame(assignments, columns=columns)
+    edited = st.data_editor(
+        frame,
+        key=f"{state.lower()}_assignment_spreadsheet",
+        use_container_width=True,
+        hide_index=True,
+        num_rows="fixed",
+        disabled=["id", "work_order_id", "title"],
+        column_config={
+            "id": st.column_config.TextColumn("Assignment ID"),
+            "day": st.column_config.SelectboxColumn("Day", options=DAYS, required=True),
+            "crew_label": st.column_config.TextColumn("Crew", required=True),
+            "work_order_id": st.column_config.TextColumn("Work order"),
+            "title": st.column_config.TextColumn("Job"),
+            "technicians": st.column_config.TextColumn("Technicians (comma separated)"),
+            "hours": st.column_config.NumberColumn("Hours", min_value=.5, max_value=24, step=.5),
+            "status": st.column_config.SelectboxColumn("Status", options=["Scheduled", "In Progress", "Deferred", "Complete"]),
+            "notes": st.column_config.TextColumn("Notes"),
+        },
+    )
+    if st.button(f"Save {state.lower()} table", type="primary", use_container_width=True, key=f"save_{state.lower()}_table"):
+        with connection() as conn:
+            for record in edited.to_dict("records"):
+                conn.execute(
+                    "UPDATE assignments SET day=?,crew_label=?,technicians=?,hours=?,status=?,notes=?,updated_at=? WHERE id=?",
+                    (cell_text(record["day"], "Monday"), cell_text(record["crew_label"], "Crew"), cell_text(record["technicians"]), max(.5, cell_float(record["hours"], 1)), cell_text(record["status"], "Scheduled"), cell_text(record["notes"]), now(), cell_text(record["id"])),
+                )
+                history(conn, cell_text(record["id"]), "Table updated", f"{state} schedule edited")
+        flash(f"{state} assignment table saved.")
+
+
+def normalize_imported_jobs(source: pd.DataFrame) -> pd.DataFrame:
+    aliases = {
+        "work_order": "id", "work_order_number": "id", "work_order_no": "id", "wo": "id", "job_id": "id",
+        "job": "title", "job_name": "title", "description": "title", "task": "title",
+        "asset_number": "asset", "equipment": "asset", "equipment_number": "asset",
+        "due": "due_at", "due_date": "due_at", "date_due": "due_at",
+        "duration": "duration_hours", "estimated_hours": "duration_hours", "job_hours": "duration_hours",
+        "crew": "crew_size", "crew_required": "crew_size", "crew_size_required": "crew_size",
+        "mechanical": "mechanical_needed", "mechanical_manpower": "mechanical_needed", "mech_needed": "mechanical_needed",
+        "welding": "welding_needed", "welding_manpower": "welding_needed", "weld_needed": "welding_needed",
+        "priority_class": "priority", "score": "priority_score",
+        "ready_to_schedule": "released", "release_to_scheduler": "released",
+    }
+    renamed: dict[str, str] = {}
+    for column in source.columns:
+        normalized = re.sub(r"[^a-z0-9]+", "_", str(column).strip().lower()).strip("_")
+        renamed[column] = aliases.get(normalized, normalized)
+    frame = source.rename(columns=renamed).copy()
+    defaults = {
+        "id": "", "title": "", "asset": "UNASSIGNED", "location": "Plant", "department": "Operations",
+        "due_at": (datetime.now() + timedelta(days=2)).replace(hour=8, minute=0, second=0, microsecond=0).isoformat(),
+        "duration_hours": 1.0, "priority": "Medium", "priority_score": 7, "status": "Pending",
+        "category": "Mechanical", "crew_size": 1, "mechanical_needed": 0, "welding_needed": 0,
+        "allowed_days": ",".join(DAYS[:5]), "preferred_day": "", "scope_ready": True, "parts_ready": True,
+        "permits_ready": True, "shutdown_ready": True, "released": True, "notes": "",
+    }
+    for column, default in defaults.items():
+        if column not in frame.columns:
+            frame[column] = default
+    frame = frame[JOB_TABLE_COLUMNS]
+    for column in ["scope_ready", "parts_ready", "permits_ready", "shutdown_ready", "released"]:
+        frame[column] = frame[column].map(lambda value: cell_bool(value, True))
+    for column, default in [("duration_hours", 1.0), ("priority_score", 7), ("crew_size", 1), ("mechanical_needed", 0), ("welding_needed", 0)]:
+        frame[column] = frame[column].map(lambda value, fallback=default: cell_float(value, fallback))
+    frame["due_at"] = frame["due_at"].map(cell_datetime)
+    frame["id"] = frame["id"].map(lambda value: cell_text(value))
+    return frame
+
+
+def job_template_excel() -> bytes:
+    template = pd.DataFrame([{
+        "work_order_number": "WO-5001", "job_name": "Inspect process pump", "asset_number": "P-101",
+        "location": "Pump house", "department": "Utilities", "due_date": (datetime.now() + timedelta(days=7)).date().isoformat(),
+        "duration_hours": 4, "priority": "High", "priority_score": 12, "status": "Pending",
+        "category": "Mechanical", "crew_size_required": 2, "mechanical_manpower": 2,
+        "welding_manpower": 0, "allowed_days": "Monday,Tuesday,Wednesday,Thursday,Friday",
+        "preferred_day": "Tuesday", "scope_ready": True, "parts_ready": True, "permits_ready": True,
+        "shutdown_ready": True, "ready_to_schedule": True, "notes": "Sample row - replace with your job",
+    }])
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        template.to_excel(writer, index=False, sheet_name="Jobs")
+    return output.getvalue()
+
+
+def excel_import_workspace(key_prefix: str) -> None:
+    st.subheader("Import jobs from Excel")
+    st.caption("Upload an .xlsx file, review every planning field in the table, then save the jobs to the backlog.")
+    st.download_button(
+        "Download Excel template", job_template_excel(), "maintainly-job-import-template.xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key=f"{key_prefix}_template",
+    )
+    upload = st.file_uploader("Upload job workbook", type=["xlsx"], key=f"{key_prefix}_upload")
+    if upload and st.button("Load workbook into editor", key=f"{key_prefix}_load", type="primary"):
+        try:
+            st.session_state[f"{key_prefix}_frame"] = normalize_imported_jobs(pd.read_excel(upload))
+            st.session_state[f"{key_prefix}_batch"] = uuid.uuid4().hex
+            st.rerun()
+        except Exception as exc:
+            st.error(f"The workbook could not be read: {exc}")
+    imported = st.session_state.get(f"{key_prefix}_frame")
+    if isinstance(imported, pd.DataFrame):
+        st.info("Edit any missing or incorrect scheduling fields below. Required fields are Job, Duration, Crew size, Allowed days, and Release.")
+        reviewed = st.data_editor(
+            imported,
+            key=f"{key_prefix}_review_{st.session_state.get(f'{key_prefix}_batch', 'current')}",
+            use_container_width=True,
+            hide_index=True,
+            num_rows="dynamic",
+            column_config=job_column_config(),
+            height=520,
+        )
+        c1, c2 = st.columns(2)
+        if c1.button("Save reviewed jobs", type="primary", use_container_width=True, key=f"{key_prefix}_commit"):
+            records = reviewed.to_dict("records")
+            if not records:
+                st.error("The import table is empty.")
+            elif any(not cell_text(record.get("title")) for record in records):
+                st.error("Every imported job needs a Job value.")
+            else:
+                created = updated = 0
+                existing_ids = {job["id"] for job in rows("SELECT id FROM work_orders")}
+                for record in records:
+                    job_id = cell_text(record.get("id")) or f"WO-{3000 + uuid.uuid4().int % 6999}"
+                    if job_id in existing_ids:
+                        updated += 1
+                    else:
+                        created += 1
+                        existing_ids.add(job_id)
+                    save_job(job_data_from_row(record), job_id)
+                st.session_state.pop(f"{key_prefix}_frame", None)
+                st.session_state.pop(f"{key_prefix}_batch", None)
+                flash(f"Excel import complete: {created} created and {updated} updated.")
+        if c2.button("Cancel import", use_container_width=True, key=f"{key_prefix}_cancel"):
+            st.session_state.pop(f"{key_prefix}_frame", None)
+            st.session_state.pop(f"{key_prefix}_batch", None)
+            st.rerun()
 
 
 def history(conn: sqlite3.Connection, assignment_id: str, action: str, detail: str = "") -> None:
@@ -425,9 +778,10 @@ elif page == "Team":
     c1.metric("Active members", len(active))
     c2.metric("Weekly capacity", f"{sum(m['weekly_hours'] for m in active):.0f}h")
     c3.metric("Skills covered", len({m["skill"] for m in active}))
-    roster, add, edit = st.tabs(["Roster", "Add member", "Edit / delete"])
+    roster, add, edit = st.tabs(["Table editor", "Add member", "Edit / delete"])
     with roster:
-        st.dataframe(pd.DataFrame([{ "Name":m["name"], "Role":m["role"], "Skill":m["skill"], "Availability":m["availability"], "Hours":m["weekly_hours"], "Active":bool(m["active"]), "Email":m["email"] } for m in team]), use_container_width=True, hide_index=True)
+        st.caption("Edit the team directly in the table, then select Save team table.")
+        team_table_editor(team)
     with add:
         submitted, data = team_form("add")
         if submitted:
@@ -463,9 +817,10 @@ elif page == "Assets":
     c1.metric("Registered assets", len(assets))
     c2.metric("Active assets", len([a for a in assets if a["active"]]))
     c3.metric("Critical assets", len([a for a in assets if a["criticality"] == "Critical"]))
-    register, add, edit = st.tabs(["Asset register", "Add asset", "Edit / delete"])
+    register, add, edit = st.tabs(["Table editor", "Add asset", "Edit / delete"])
     with register:
-        st.dataframe(pd.DataFrame([{ "Asset":a["asset_number"], "Name":a["asset_name"], "Location":a["location"], "Department":a["department"], "Criticality":a["criticality"], "Active":bool(a["active"]) } for a in assets]), use_container_width=True, hide_index=True)
+        st.caption("Edit asset records directly in the table, then save all changes.")
+        asset_table_editor(assets)
     with add:
         submitted, data = asset_form("add")
         if submitted:
@@ -494,7 +849,7 @@ elif page == "Assets":
 elif page == "Work orders":
     title("Work orders", "Prioritize, assign and close out maintenance work.")
     jobs = rows("SELECT * FROM work_orders ORDER BY priority_score DESC,due_at")
-    add, register, edit = st.tabs(["Add work order", "Register", "Edit / delete"])
+    add, register, import_tab, edit = st.tabs(["Add work order", "Table editor", "Import Excel", "Edit / delete"])
     with add:
         submitted, data = job_form("add")
         if submitted:
@@ -506,7 +861,10 @@ elif page == "Work orders":
     with register:
         filter_value = st.selectbox("Filter", ["Open", "All", *JOB_STATUSES])
         filtered = jobs if filter_value == "All" else [j for j in jobs if (j["status"] != "Completed" if filter_value == "Open" else j["status"] == filter_value)]
-        st.dataframe(pd.DataFrame([{ "Work order":j["id"], "Job":j["title"], "Asset":j["asset"], "Due":j["due_at"].replace("T", " ")[:16], "Priority":j["priority"], "Crew":j["crew_size"], "Status":j["status"] } for j in filtered]), use_container_width=True, hide_index=True)
+        st.caption("Edit work orders and scheduling requirements in spreadsheet form, then save the table.")
+        job_table_editor(filtered, "work_order_table")
+    with import_tab:
+        excel_import_workspace("work_orders_excel")
     with edit:
         if jobs:
             labels = {j["id"]: f"{j['id']} - {j['title']}" for j in jobs}
@@ -536,7 +894,8 @@ elif page == "Planning":
         c3.metric("Final assignments", len(final))
         c4.metric("Completed", len(jobs) - len(open_jobs))
     with readiness:
-        st.dataframe(pd.DataFrame([{ "Work order":j["id"], "Job":j["title"], "Scope":bool(j["scope_ready"]), "Parts":bool(j["parts_ready"]), "Permits":bool(j["permits_ready"]), "Shutdown":bool(j["shutdown_ready"]), "Released":bool(j["released"]), "Ready":j in ready } for j in open_jobs]), use_container_width=True, hide_index=True)
+        st.caption("Correct readiness, labor, allowed days, duration, and priority here before generating the schedule.")
+        job_table_editor(open_jobs, "planning_readiness_table")
     with draft_tab:
         c1, c2, c3 = st.columns(3)
         limit = c1.number_input("Daily limit", 4.0, 12.0, 8.0, .5)
@@ -547,7 +906,8 @@ elif page == "Planning":
             flash(f"{count} draft assignment(s) generated.")
         for warning in st.session_state.get("warnings", []):
             st.warning(warning)
-        st.dataframe(pd.DataFrame([{ "Day":a["day"], "Crew":a["crew_label"], "Work order":a["work_order_id"], "Job":a["title"], "Technicians":a["technicians"].replace(",", ", "), "Hours":a["hours"], "Status":a["status"] } for a in draft]), use_container_width=True, hide_index=True)
+        st.caption("Edit the generated draft directly in the table and save before promoting it.")
+        assignment_table_editor("Draft", draft)
         if st.button("Promote all draft assignments"):
             flash(f"{promote_all()} assignment(s) promoted to Final.")
         if draft and st.button("Clear draft schedule"):
@@ -556,7 +916,8 @@ elif page == "Planning":
                 conn.execute("UPDATE work_orders SET status='Pending' WHERE status='Draft Scheduled'")
             flash("Draft schedule cleared.")
     with final_tab:
-        st.dataframe(pd.DataFrame([{ "Day":a["day"], "Crew":a["crew_label"], "Work order":a["work_order_id"], "Job":a["title"], "Technicians":a["technicians"].replace(",", ", "), "Hours":a["hours"], "Status":a["status"] } for a in final]), use_container_width=True, hide_index=True)
+        st.caption("Edit the committed schedule directly in the table, then save your changes.")
+        assignment_table_editor("Final", final)
         if final:
             labels = {a["id"]: f"{a['day']} - {a['crew_label']} - {a['work_order_id']}" for a in final}
             assignment_id = st.selectbox("Select final assignment", list(labels), format_func=labels.get)
@@ -585,6 +946,8 @@ elif page == "Planning":
             writer = csv.DictWriter(buffer, fieldnames=list(export_rows[0]))
             writer.writeheader(); writer.writerows(export_rows)
         st.download_button("Download work orders CSV", buffer.getvalue(), "maintainly-work-orders.csv", "text/csv", type="primary")
+        st.markdown("---")
+        excel_import_workspace("planning_excel")
 
 else:
     title("Reports", "Turn maintenance activity into clear operational decisions.")
