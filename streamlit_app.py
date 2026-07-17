@@ -13,6 +13,12 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
+try:
+    import openpyxl  # noqa: F401
+    EXCEL_SUPPORT = True
+except ModuleNotFoundError:
+    EXCEL_SUPPORT = False
+
 
 # =========================================================
 # MAINTAINLY - SINGLE-FILE STREAMLIT EDITION
@@ -497,8 +503,8 @@ def normalize_imported_jobs(source: pd.DataFrame) -> pd.DataFrame:
     return frame
 
 
-def job_template_excel() -> bytes:
-    template = pd.DataFrame([{
+def job_template_frame() -> pd.DataFrame:
+    return pd.DataFrame([{
         "work_order_number": "WO-5001", "job_name": "Inspect process pump", "asset_number": "P-101",
         "location": "Pump house", "department": "Utilities", "due_date": (datetime.now() + timedelta(days=7)).date().isoformat(),
         "duration_hours": 4, "priority": "High", "priority_score": 12, "status": "Pending",
@@ -507,6 +513,12 @@ def job_template_excel() -> bytes:
         "preferred_day": "Tuesday", "scope_ready": True, "parts_ready": True, "permits_ready": True,
         "shutdown_ready": True, "ready_to_schedule": True, "notes": "Sample row - replace with your job",
     }])
+
+
+def job_template_excel() -> bytes | None:
+    if not EXCEL_SUPPORT:
+        return None
+    template = job_template_frame()
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         template.to_excel(writer, index=False, sheet_name="Jobs")
@@ -516,16 +528,31 @@ def job_template_excel() -> bytes:
 def excel_import_workspace(key_prefix: str) -> None:
     st.subheader("Import jobs from Excel")
     st.caption("Upload an .xlsx file, review every planning field in the table, then save the jobs to the backlog.")
-    st.download_button(
-        "Download Excel template", job_template_excel(), "maintainly-job-import-template.xlsx",
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key=f"{key_prefix}_template",
-    )
-    upload = st.file_uploader("Upload job workbook", type=["xlsx"], key=f"{key_prefix}_upload")
+    template_bytes = job_template_excel()
+    if template_bytes is not None:
+        st.download_button(
+            "Download Excel template", template_bytes, "maintainly-job-import-template.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key=f"{key_prefix}_template",
+        )
+    else:
+        st.warning("Excel support is not installed. Add openpyxl>=3.1,<4 to requirements.txt and reboot the app. You can use the CSV template until then.")
+        st.download_button(
+            "Download CSV template", job_template_frame().to_csv(index=False).encode("utf-8"),
+            "maintainly-job-import-template.csv", "text/csv", key=f"{key_prefix}_csv_template",
+        )
+    upload_types = ["xlsx", "csv"] if EXCEL_SUPPORT else ["csv"]
+    upload = st.file_uploader("Upload job workbook", type=upload_types, key=f"{key_prefix}_upload")
     if upload and st.button("Load workbook into editor", key=f"{key_prefix}_load", type="primary"):
         try:
-            st.session_state[f"{key_prefix}_frame"] = normalize_imported_jobs(pd.read_excel(upload))
+            if upload.name.lower().endswith(".csv"):
+                source_frame = pd.read_csv(upload)
+            else:
+                source_frame = pd.read_excel(upload, engine="openpyxl")
+            st.session_state[f"{key_prefix}_frame"] = normalize_imported_jobs(source_frame)
             st.session_state[f"{key_prefix}_batch"] = uuid.uuid4().hex
             st.rerun()
+        except ModuleNotFoundError:
+            st.error("Excel support is missing. Add openpyxl>=3.1,<4 to requirements.txt, reboot the app, and upload the workbook again.")
         except Exception as exc:
             st.error(f"The workbook could not be read: {exc}")
     imported = st.session_state.get(f"{key_prefix}_frame")
